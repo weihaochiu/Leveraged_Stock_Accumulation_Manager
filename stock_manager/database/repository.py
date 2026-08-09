@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
 from stock_manager.domain import calculate_lot_metrics, dec, money
+from stock_manager.pricing.models import MarketQuote, SecurityUpdateResult
 from .connection import Database
 
 
@@ -30,7 +31,10 @@ class PortfolioRepository:
         with self.db.transaction() as conn:
             old = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
             conn.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP", (key, str(value)))
-            self._audit(conn, "修改", "設定", key, _dict(old), {"value": str(value)})
+            if key == "price_finmind_token":
+                self._audit(conn, "修改", "設定", key, {"value": "***"} if old else None, {"value": "***"})
+            else:
+                self._audit(conn, "修改", "設定", key, _dict(old), {"value": str(value)})
 
     def list_securities(self) -> list[dict]:
         with self.db.connect() as conn:
@@ -59,6 +63,45 @@ class PortfolioRepository:
                 ) VALUES (?,?,?,?,?)
             """, (security_id, float(settings["default_target_return_pct"]), float(settings["near_target_alert_pct"]), float(settings["default_buy_budget"]), float(settings["recovery_tolerance_amount"])))
             return security_id
+
+    def update_security_market(self, security_id: int, market: str) -> None:
+        if market not in {"TWSE", "TPEx", "TW"}:
+            raise ValueError("市場必須為 TWSE、TPEx 或待辨識 TW")
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE securities SET market=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (market, security_id),
+            )
+
+    def list_held_securities(self, security_ids: list[int] | None = None) -> list[dict]:
+        """僅回傳目前淨持股大於零的股票，每檔只出現一次。"""
+        params: list[object] = []
+        id_filter = ""
+        if security_ids:
+            placeholders = ",".join("?" for _ in security_ids)
+            id_filter = f" AND s.id IN ({placeholders})"
+            params.extend(security_ids)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT s.*,
+                    COALESCE(SUM(b.original_shares),0)
+                    + COALESCE((SELECT SUM(ca.share_change) FROM corporate_actions ca
+                                JOIN buy_lots cb ON cb.id=ca.lot_id
+                                WHERE ca.security_id=s.id AND cb.archived=0),0)
+                    - COALESCE((SELECT SUM(st.shares) FROM sell_transactions st
+                                JOIN buy_lots sb ON sb.id=st.lot_id
+                                WHERE st.security_id=s.id AND sb.archived=0),0) AS held_shares
+                FROM securities s
+                JOIN buy_lots b ON b.security_id=s.id AND b.archived=0
+                WHERE s.active=1 {id_filter}
+                GROUP BY s.id
+                HAVING held_shares > 0
+                ORDER BY s.symbol
+                """,
+                params,
+            )
+            return [dict(row) for row in rows]
 
     def update_security_strategy(self, security_id: int, values: dict) -> None:
         allowed = {
@@ -224,9 +267,143 @@ class PortfolioRepository:
         if dec(price) <= 0:
             raise ValueError("股價必須大於 0")
         with self.db.transaction() as conn:
-            conn.execute("""INSERT INTO price_history(security_id,price,price_date,source) VALUES (?,?,?,?)
-                ON CONFLICT(security_id,price_date,source) DO UPDATE SET price=excluded.price,updated_at=CURRENT_TIMESTAMP""", (security_id, float(dec(price)), price_date, source))
-            self._audit(conn, "修改", "股票價格", str(security_id), None, {"price": str(price), "price_date": price_date, "source": source})
+            actual_source = "MANUAL" if source in {"MANUAL", "手動輸入"} else source
+            conn.execute("""INSERT INTO price_history(
+                    security_id,price,price_date,source,quote_type,fetched_at,is_manual_override
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(security_id,price_date,source) DO UPDATE SET
+                    price=excluded.price,quote_type=excluded.quote_type,fetched_at=excluded.fetched_at,
+                    is_manual_override=excluded.is_manual_override,updated_at=CURRENT_TIMESTAMP""",
+                (security_id, float(dec(price)), price_date, actual_source, "MANUAL", datetime.now().astimezone().isoformat(timespec="seconds"), 1))
+            self._audit(conn, "修改", "股票價格", str(security_id), None, {"price": str(price), "price_date": price_date, "source": actual_source})
+
+    def latest_price(self, security_id: int) -> dict | None:
+        with self.db.connect() as conn:
+            return _dict(conn.execute(
+                """SELECT * FROM price_history WHERE security_id=?
+                   ORDER BY price_date DESC,
+                     CASE WHEN is_manual_override=1 THEN 3 WHEN source IN ('TWSE','TPEx') THEN 2 ELSE 1 END DESC,
+                     updated_at DESC LIMIT 1""",
+                (security_id,),
+            ).fetchone())
+
+    def save_market_quote(self, security_id: int, quote: MarketQuote) -> None:
+        if quote.close <= 0:
+            raise ValueError("收盤價必須大於 0")
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO price_history(
+                    security_id,price,price_date,source,exchange,open_price,high_price,low_price,
+                    volume_shares,turnover_twd,transaction_count,price_change,quote_type,fetched_at,
+                    is_manual_override,warning_message
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+                ON CONFLICT(security_id,price_date,source) DO UPDATE SET
+                    price=excluded.price,exchange=excluded.exchange,open_price=excluded.open_price,
+                    high_price=excluded.high_price,low_price=excluded.low_price,
+                    volume_shares=excluded.volume_shares,turnover_twd=excluded.turnover_twd,
+                    transaction_count=excluded.transaction_count,price_change=excluded.price_change,
+                    quote_type=excluded.quote_type,fetched_at=excluded.fetched_at,
+                    warning_message=excluded.warning_message,updated_at=CURRENT_TIMESTAMP""",
+                (
+                    security_id, float(quote.close), quote.trade_date.isoformat(), quote.source,
+                    quote.exchange, float(quote.open) if quote.open is not None else None,
+                    float(quote.high) if quote.high is not None else None,
+                    float(quote.low) if quote.low is not None else None,
+                    quote.volume_shares, quote.turnover_twd, quote.transaction_count,
+                    float(quote.price_change) if quote.price_change is not None else None,
+                    quote.quote_type, quote.fetched_at.isoformat(timespec="seconds"), quote.warning_message,
+                ),
+            )
+
+    def create_price_update_run(self, trigger_type: str, planned_count: int, started_at: datetime) -> int:
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO price_update_runs(trigger_type,started_at,planned_count) VALUES (?,?,?)",
+                (trigger_type, started_at.isoformat(timespec="seconds"), planned_count),
+            )
+            return int(cursor.lastrowid)
+
+    def add_price_update_result(self, run_id: int, result: SecurityUpdateResult) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO price_update_details(
+                    run_id,security_id,status,source,retry_count,trade_date,message
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(run_id,security_id) DO UPDATE SET
+                    status=excluded.status,source=excluded.source,retry_count=excluded.retry_count,
+                    trade_date=excluded.trade_date,message=excluded.message,created_at=CURRENT_TIMESTAMP""",
+                (run_id, result.security_id, result.status.value, result.source, result.retry_count,
+                 result.trade_date.isoformat() if result.trade_date else None, result.message),
+            )
+
+    def finish_price_update_run(self, run_id: int, completed_at: datetime, counts: dict[str, int], status: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                """UPDATE price_update_runs SET completed_at=?,success_count=?,fallback_success_count=?,
+                    failed_count=?,skipped_count=?,status=? WHERE id=?""",
+                (completed_at.isoformat(timespec="seconds"), counts["success"], counts["fallback"],
+                 counts["failed"], counts["skipped"], status, run_id),
+            )
+
+    def record_provider_health(self, source: str, success: bool, error: str = "") -> None:
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with self.db.transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO price_provider_health(source) VALUES (?)", (source,))
+            if success:
+                conn.execute(
+                    "UPDATE price_provider_health SET last_success_at=?,consecutive_failures=0,last_error='' WHERE source=?",
+                    (now, source),
+                )
+            else:
+                conn.execute(
+                    """UPDATE price_provider_health SET last_failure_at=?,
+                       consecutive_failures=consecutive_failures+1,last_error=? WHERE source=?""",
+                    (now, error, source),
+                )
+
+    def price_status_rows(self) -> list[dict]:
+        securities = self.list_held_securities()
+        result = []
+        with self.db.connect() as conn:
+            for security in securities:
+                latest = conn.execute(
+                    """SELECT * FROM price_history WHERE security_id=? ORDER BY price_date DESC,
+                       CASE WHEN is_manual_override=1 THEN 3 WHEN source IN ('TWSE','TPEx') THEN 2 ELSE 1 END DESC,
+                       updated_at DESC LIMIT 1""",
+                    (security["id"],),
+                ).fetchone()
+                failure = conn.execute(
+                    """SELECT d.* FROM price_update_details d
+                       WHERE d.security_id=? AND d.status='FAILED' ORDER BY d.created_at DESC LIMIT 1""",
+                    (security["id"],),
+                ).fetchone()
+                row = {**security, **(dict(latest) if latest else {})}
+                row["security_id"] = security["id"]
+                fetched_at = str(row.get("fetched_at") or row.get("updated_at") or "")
+                failed_time = str(failure["created_at"] if failure else "").replace("T", " ")[:19]
+                price_time = fetched_at.replace("T", " ")[:19]
+                failed_after_price = bool(failure and failed_time > price_time)
+                if not latest:
+                    row["price_status"] = "無價格"
+                elif failed_after_price:
+                    row["price_status"] = "過期／更新失敗"
+                elif row.get("is_manual_override"):
+                    row["price_status"] = "手動覆寫"
+                elif row.get("source") == "FinMind":
+                    row["price_status"] = "備援"
+                elif fetched_at[:10] == date.today().isoformat():
+                    row["price_status"] = "最新可取得"
+                else:
+                    row["price_status"] = "快取"
+                row["last_error"] = failure["message"] if failed_after_price else ""
+                result.append(row)
+        return result
+
+    def price_update_runs(self, limit: int = 200) -> list[dict]:
+        with self.db.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM price_update_runs ORDER BY id DESC LIMIT ?", (limit,)
+            )]
 
     def get_lot(self, lot_id: str) -> dict | None:
         with self.db.connect() as conn:
@@ -254,8 +431,10 @@ class PortfolioRepository:
             lots = [dict(r) for r in conn.execute("""
                 SELECT b.*,s.symbol,s.name AS security_name,s.market,
                     br.name AS broker_name,ss.near_target_alert_pct,
-                    (SELECT price FROM price_history p WHERE p.security_id=b.security_id ORDER BY p.price_date DESC,p.updated_at DESC LIMIT 1) current_price,
-                    (SELECT price_date FROM price_history p WHERE p.security_id=b.security_id ORDER BY p.price_date DESC,p.updated_at DESC LIMIT 1) price_date,
+                    (SELECT price FROM price_history p WHERE p.security_id=b.security_id ORDER BY p.price_date DESC,
+                        CASE WHEN p.is_manual_override=1 THEN 3 WHEN p.source IN ('TWSE','TPEx') THEN 2 ELSE 1 END DESC,p.updated_at DESC LIMIT 1) current_price,
+                    (SELECT price_date FROM price_history p WHERE p.security_id=b.security_id ORDER BY p.price_date DESC,
+                        CASE WHEN p.is_manual_override=1 THEN 3 WHEN p.source IN ('TWSE','TPEx') THEN 2 ELSE 1 END DESC,p.updated_at DESC LIMIT 1) price_date,
                     COALESCE((SELECT SUM(amount) FROM loan_transactions lt WHERE lt.lot_id=b.id AND lt.transaction_type='INTEREST'),0) loan_interest,
                     COALESCE((SELECT SUM(net_amount) FROM dividends d WHERE d.lot_id=b.id AND d.include_in_recovery=1),0) dividend_recovery,
                     COALESCE((SELECT SUM(share_change) FROM corporate_actions ca WHERE ca.lot_id=b.id),0) action_share_change,
@@ -305,11 +484,16 @@ class PortfolioRepository:
             return [dict(r) for r in conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))]
 
     def table_rows(self, table: str) -> list[dict]:
-        allowed = {"buy_lots", "sell_transactions", "dividends", "corporate_actions", "loans", "loan_transactions", "securities", "security_strategies", "price_history", "broker_accounts", "reconciliations", "ocr_drafts", "settings", "audit_log", "backup_targets", "backup_runs", "backup_target_results"}
+        allowed = {"buy_lots", "sell_transactions", "dividends", "corporate_actions", "loans", "loan_transactions", "securities", "security_strategies", "price_history", "price_update_runs", "price_update_details", "price_provider_health", "broker_accounts", "reconciliations", "ocr_drafts", "settings", "audit_log", "backup_targets", "backup_runs", "backup_target_results"}
         if table not in allowed:
             raise ValueError("不允許匯出的資料表")
         with self.db.connect() as conn:
-            return [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+            rows = [dict(r) for r in conn.execute(f"SELECT * FROM {table}")]
+        if table == "settings":
+            for row in rows:
+                if row.get("key") == "price_finmind_token" and row.get("value"):
+                    row["value"] = "***（未匯出）"
+        return rows
 
     def _reserve_trade_key(self, conn: sqlite3.Connection, values: dict, tx_type: str, tx_id: str) -> None:
         broker_id = values.get("broker_account_id")

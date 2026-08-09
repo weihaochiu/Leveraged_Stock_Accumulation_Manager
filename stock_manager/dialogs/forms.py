@@ -58,6 +58,8 @@ class BuyDialog(BaseDialog):
         self.name = QLineEdit(); self.name.setPlaceholderText("例如：富邦台50")
         sec_line = QHBoxLayout(); sec_line.addWidget(self.security, 2); sec_line.addWidget(QLabel("或新增：")); sec_line.addWidget(self.symbol); sec_line.addWidget(self.name)
         self.form.addRow("股票", sec_line)
+        self.market = QComboBox(); self.market.addItem("自動辨識", "TW"); self.market.addItem("上市（TWSE）", "TWSE"); self.market.addItem("上櫃（TPEx）", "TPEx")
+        self.form.addRow("新股票市場", self.market)
         self.broker = QComboBox(); self.broker.addItem("未指定", None)
         for row in repository.list_brokers(): self.broker.addItem(f"{row['name']} {row['account_label']}", row["id"])
         self.buy_date = _date_edit(); self.price = _money_spin(); self.shares = QSpinBox(); self.shares.setRange(1, 100_000_000)
@@ -124,7 +126,7 @@ class BuyDialog(BaseDialog):
     def submit(self):
         try:
             sec = self.security.currentData()
-            security_id = sec["id"] if sec else self.repository.ensure_security(self.symbol.text(), self.name.text())
+            security_id = sec["id"] if sec else self.repository.ensure_security(self.symbol.text(), self.name.text(), self.market.currentData())
             total = self.stock_amount.value() + self.fee.value() + self.other_cost.value()
             self.repository.add_buy_lot({
                 "security_id": security_id, "broker_account_id": self.broker.currentData(),
@@ -283,7 +285,7 @@ class PriceDialog(BaseDialog):
     def submit(self):
         try:
             if self.security.currentData() is None: raise ValueError("尚無股票資料")
-            self.repository.add_price(self.security.currentData(), self.price.value(), self.date.date().toString("yyyy-MM-dd"), "手動輸入")
+            self.repository.add_price(self.security.currentData(), self.price.value(), self.date.date().toString("yyyy-MM-dd"), "MANUAL")
             self.accept()
         except Exception as exc: self.fail(exc)
 

@@ -39,6 +39,20 @@ class SettingsDialog(QDialog):
         self.frequency = QComboBox(); self.frequency.addItem("每日第一次啟動", "DAILY_FIRST"); self.frequency.addItem("每次啟動", "EVERY_START")
         idx = self.frequency.findData(s["backup_frequency"]); self.frequency.setCurrentIndex(max(0, idx)); df.addRow(self.backup_start); df.addRow("啟動備份頻率", self.frequency)
         broker_button = QPushButton("新增券商帳戶"); broker_button.clicked.connect(self._add_broker); df.addRow("券商設定", broker_button); tabs.addTab(data, "資料與券商")
+        price = QWidget(); pf = QFormLayout(price)
+        self.price_startup = QCheckBox("程式啟動後在背景補更新目前持股"); self.price_startup.setChecked(s.get("price_auto_update_on_startup", "1") == "1")
+        self.price_schedule = QCheckBox("啟用盤後自動排程"); self.price_schedule.setChecked(s.get("price_schedule_enabled", "1") == "1")
+        self.price_times = QLineEdit(s.get("price_schedule_times", "14:30,15:00,17:00")); self.price_times.setPlaceholderText("例如：14:30,15:00,17:00")
+        self.price_timeout = QSpinBox(); self.price_timeout.setRange(3, 60); self.price_timeout.setValue(int(float(s.get("price_request_timeout_seconds", 12))))
+        self.price_retries = QLineEdit(s.get("price_retry_delays_seconds", "2,5")); self.price_retries.setPlaceholderText("例如：2,5")
+        self.price_anomaly = self._spin(1, 1000, 1, float(s.get("price_anomaly_threshold_pct", 20)))
+        self.finmind_enabled = QCheckBox("官方來源失敗時啟用 FinMind 備援"); self.finmind_enabled.setChecked(s.get("price_finmind_fallback_enabled", "0") == "1")
+        self.finmind_token = QLineEdit(s.get("price_finmind_token", "")); self.finmind_token.setEchoMode(QLineEdit.Password); self.finmind_token.setPlaceholderText("選填；由 FinMind 帳號取得 API Token")
+        for label, widget in (("啟動更新", self.price_startup), ("盤後排程", self.price_schedule), ("更新時間", self.price_times),
+                              ("單次連線逾時（秒）", self.price_timeout), ("重試間隔（秒）", self.price_retries),
+                              ("價格差異警告門檻 %", self.price_anomaly), ("第三方備援", self.finmind_enabled), ("FinMind Token", self.finmind_token)):
+            pf.addRow(label, widget)
+        tabs.addTab(price, "股價更新")
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel); buttons.button(QDialogButtonBox.Save).setText("儲存"); buttons.button(QDialogButtonBox.Cancel).setText("取消")
         buttons.accepted.connect(self.save); buttons.rejected.connect(self.reject); root.addWidget(buttons)
 
@@ -58,10 +72,24 @@ class SettingsDialog(QDialog):
         index=self.stock_funding.findData(row["default_funding_preference"]); self.stock_funding.setCurrentIndex(max(0,index))
 
     def save(self):
+        try:
+            times = [item.strip() for item in self.price_times.text().split(",") if item.strip()]
+            if not times or any(len(item) != 5 or item[2] != ":" or not (0 <= int(item[:2]) <= 23 and 0 <= int(item[3:]) <= 59) for item in times):
+                raise ValueError
+            retry_values = [float(item.strip()) for item in self.price_retries.text().split(",") if item.strip()]
+            if len(retry_values) > 3 or any(value < 0 or value > 60 for value in retry_values):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "股價更新設定錯誤", "更新時間請使用 HH:MM 並以逗號分隔；重試間隔最多三組且須為 0–60 秒。")
+            return
         values = {"commission_rate": self.commission_rate.value(), "commission_discount": self.discount.value(), "minimum_commission": self.minimum.value(),
                   "sell_tax_rate": self.tax.value(), "default_target_return_pct": self.target.value(), "near_target_alert_pct": self.near.value(),
                   "default_buy_budget": self.budget.value(), "recovery_tolerance_amount": self.tolerance.value(), "backup_on_startup": int(self.backup_start.isChecked()),
-                  "backup_frequency": self.frequency.currentData()}
+                  "backup_frequency": self.frequency.currentData(), "price_auto_update_on_startup": int(self.price_startup.isChecked()),
+                  "price_schedule_enabled": int(self.price_schedule.isChecked()), "price_schedule_times": ",".join(times),
+                  "price_request_timeout_seconds": self.price_timeout.value(), "price_retry_delays_seconds": ",".join(str(value).rstrip("0").rstrip(".") for value in retry_values),
+                  "price_anomaly_threshold_pct": self.price_anomaly.value(), "price_finmind_fallback_enabled": int(self.finmind_enabled.isChecked()),
+                  "price_finmind_token": self.finmind_token.text().strip()}
         for key, value in values.items(): self.repository.set_setting(key, value)
         row=self.stock_strategy.currentData()
         if row:

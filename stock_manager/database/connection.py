@@ -39,11 +39,40 @@ class Database:
     def initialize(self) -> None:
         with self.transaction() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate(conn)
             row = conn.execute("SELECT MAX(version) AS version FROM schema_info").fetchone()
             if row["version"] is None:
                 conn.execute("INSERT INTO schema_info(version) VALUES (?)", (DB_SCHEMA_VERSION,))
+            elif int(row["version"]) < DB_SCHEMA_VERSION:
+                conn.execute("INSERT INTO schema_info(version) VALUES (?)", (DB_SCHEMA_VERSION,))
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, value))
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """以非破壞方式補齊舊版 SQLite 欄位。"""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(price_history)")}
+        additions = {
+            "exchange": "TEXT NOT NULL DEFAULT ''",
+            "open_price": "REAL",
+            "high_price": "REAL",
+            "low_price": "REAL",
+            "volume_shares": "INTEGER",
+            "turnover_twd": "INTEGER",
+            "transaction_count": "INTEGER",
+            "price_change": "REAL",
+            "quote_type": "TEXT NOT NULL DEFAULT 'CLOSE'",
+            "fetched_at": "TEXT",
+            "is_manual_override": "INTEGER NOT NULL DEFAULT 0",
+            "warning_message": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE price_history ADD COLUMN {column} {definition}")
+        conn.execute(
+            "UPDATE price_history SET fetched_at=COALESCE(fetched_at,updated_at), "
+            "is_manual_override=CASE WHEN source IN ('MANUAL','手動輸入') THEN 1 ELSE is_manual_override END"
+        )
 
     def integrity_check(self) -> bool:
         with self.connect() as conn:
@@ -54,4 +83,3 @@ class Database:
         conn.execute("UPDATE sequences SET value=value+1 WHERE name=?", (name,))
         value = conn.execute("SELECT value FROM sequences WHERE name=?", (name,)).fetchone()[0]
         return f"{prefix}-{value:06d}"
-

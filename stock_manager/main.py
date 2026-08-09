@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from datetime import date
 
-from stock_manager.config import APP_NAME, AppPaths
+from stock_manager.config import APP_NAME, APP_VERSION, AppPaths
 from stock_manager.database import Database, PortfolioRepository
 from stock_manager.import_export import BackupService
 from stock_manager.utils.logging_setup import configure_logging
@@ -17,7 +17,7 @@ def main() -> int:
         return 2
     from stock_manager.app.main_window import MainWindow
     try:
-        from stock_manager.ui import THEME_VERSION, apply_light_theme
+        from stock_manager.ui import apply_light_theme
     except (ImportError, OSError) as exc:
         print(f"配色主題檔案不完整或未放在正確位置：{exc}")
         print("請將更新 ZIP 解壓縮到原程式根目錄，並確認已覆蓋 stock_manager 資料夾。")
@@ -45,5 +45,5 @@ def main() -> int:
         )
         return 3
     window=MainWindow(repository,paths,backup,startup_result)
-    window.setWindowTitle(f"{APP_NAME} v{THEME_VERSION}｜淺色主題修正版")
+    window.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
     window.show(); return app.exec()

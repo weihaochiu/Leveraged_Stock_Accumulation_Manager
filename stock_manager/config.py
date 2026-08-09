@@ -6,8 +6,8 @@ from pathlib import Path
 
 
 APP_NAME = "貸款槓桿存股管理系統"
-APP_VERSION = "1.0.0"
-DB_SCHEMA_VERSION = 1
+APP_VERSION = "1.1.0"
+DB_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -34,4 +34,3 @@ class AppPaths:
         for directory in (paths.root, paths.data, paths.logs, paths.exports, paths.backups):
             directory.mkdir(parents=True, exist_ok=True)
         return paths
-

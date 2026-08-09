@@ -18,8 +18,10 @@ from stock_manager.dialogs.data_dialogs import AuditDialog, BackupHistoryDialog,
 from stock_manager.dialogs.forms import BuyDialog, CorporateActionDialog, DividendDialog, LoanDialog, LoanTransactionDialog, PriceDialog, ReconciliationDialog, SellDialog
 from stock_manager.dialogs.recovery_dialog import RecoveryDialog
 from stock_manager.dialogs.ocr_dialog import OCRWorkbenchDialog
+from stock_manager.dialogs.price_dialog import PriceStatusDialog
 from stock_manager.domain import FundingType, StrategyStatus, zh
 from stock_manager.import_export import BackupService, ExcelService
+from stock_manager.pricing.price_scheduler import PriceScheduler
 from stock_manager.services import PortfolioService
 from stock_manager.utils.formatting import currency, number, percent
 
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.repository=repository; self.paths=paths; self.backup=backup; self.portfolio=PortfolioService(repository); self.excel=ExcelService(repository); self._rows=[]
         self.setWindowTitle(APP_NAME); self.resize(1500, 850); self._build_toolbar(); self._build_central(); self._build_status(); self.refresh()
         if startup_backup: self.show_backup_result(startup_backup, startup=True)
+        self.price_scheduler=PriceScheduler(repository,self); self.price_scheduler.update_started.connect(self._price_update_started); self.price_scheduler.update_progress.connect(self._price_update_progress); self.price_scheduler.update_finished.connect(self._price_update_finished); self.price_scheduler.update_failed.connect(self._price_update_failed); self.price_scheduler.start()
 
     def _build_toolbar(self):
         toolbar=QToolBar("主要工具列"); toolbar.setMovable(False); toolbar.setToolButtonStyle(Qt.ToolButtonTextOnly); self.addToolBar(toolbar)
@@ -114,7 +117,9 @@ class MainWindow(QMainWindow):
         self._button(toolbar,"截圖匯入",lambda:OCRWorkbenchDialog(self.repository,self).exec())
         loan_menu=QMenu(self); loan_menu.addAction("新增貸款帳戶",lambda:self.open_dialog(LoanDialog(self.repository,self))); loan_menu.addAction("新增還款／利息",lambda:self.open_dialog(LoanTransactionDialog(self.repository,self)))
         self._menu_button(toolbar,"貸款與資金",loan_menu); toolbar.addSeparator()
-        self._button(toolbar,"回本模擬",self.simulate); self._button(toolbar,"更新股價",lambda:self.open_dialog(PriceDialog(self.repository,self)))
+        self._button(toolbar,"回本模擬",self.simulate)
+        price_menu=QMenu(self); price_menu.addAction("更新全部目前持股",lambda:self.trigger_price_update("MANUAL_ALL")); price_menu.addAction("更新選取股票",self.update_selected_price); price_menu.addSeparator(); price_menu.addAction("手動輸入價格",lambda:self.open_dialog(PriceDialog(self.repository,self))); price_menu.addAction("股價狀態與紀錄",self.show_price_status)
+        self._menu_button(toolbar,"更新股價",price_menu)
         self._button(toolbar,"修改批次策略",self.edit_lot_strategy)
         self._button(toolbar,"對帳",lambda:self.open_dialog(ReconciliationDialog(self.repository,self))); self._button(toolbar,"分析",lambda:AnalysisDialog(self.repository,self).exec()); toolbar.addSeparator()
         data=QMenu(self); data.addAction("從 Excel 匯入",self.import_excel); data.addAction("匯出完整 Excel",self.export_excel); data.addAction("匯出目前表格 CSV",self.export_csv); data.addSeparator()
@@ -142,14 +147,14 @@ class MainWindow(QMainWindow):
         self.view=QComboBox()
         for text,value in (("基本＋市場","basic"),("市場","market"),("回收","recovery"),("持股","position"),("貸款","loan"),("全部欄位","all")): self.view.addItem(text,value)
         self.view.currentIndexChanged.connect(lambda:self.table.apply_view(self.view.currentData()))
-        for label,w in (("",self.search),("股票",self.security_filter),("券商",self.broker_filter),("資金",self.funding_filter),("狀態",self.status_filter),("欄位檢視",self.view)): 
+        for label,w in (("",self.search),("股票",self.security_filter),("券商",self.broker_filter),("資金",self.funding_filter),("狀態",self.status_filter),("欄位檢視",self.view)):
             if label: filters.addWidget(QLabel(label))
             filters.addWidget(w)
         root.addLayout(filters); self.kpi=QLabel(); self.kpi.setStyleSheet("QLabel{background:#EFF6FF;border:1px solid #BFDBFE;border-radius:6px;padding:10px;font-size:14px}"); root.addWidget(self.kpi)
         self.table=MasterTable(); self.table.doubleClicked.connect(self.show_detail); root.addWidget(self.table)
 
     def _build_status(self):
-        status=QStatusBar(); self.setStatusBar(status); self.status_text=QLabel(); status.addWidget(self.status_text,1); self.backup_text=QLabel("備份：尚未執行"); status.addPermanentWidget(self.backup_text)
+        status=QStatusBar(); self.setStatusBar(status); self.status_text=QLabel(); status.addWidget(self.status_text,1); self.price_text=QLabel("股價：等待自動檢查"); status.addPermanentWidget(self.price_text); self.backup_text=QLabel("備份：尚未執行"); status.addPermanentWidget(self.backup_text)
 
     def refresh(self):
         self._sync_filters()
@@ -185,6 +190,46 @@ class MainWindow(QMainWindow):
     def show_detail(self):
         lot_id=self.selected_id(); row=next((r for r in self._rows if r["id"]==lot_id),None)
         if row: LotDetailDialog(row,self.repository,self).exec()
+
+    def trigger_price_update(self, trigger_type="MANUAL_ALL", security_ids=None):
+        if not self.price_scheduler.trigger(trigger_type,security_ids=security_ids,force=trigger_type.startswith("MANUAL")):
+            QMessageBox.information(self,"股價更新進行中","另一個股價更新批次尚未完成，請稍後再試。")
+
+    def update_selected_price(self):
+        lot_id=self.selected_id(); row=next((item for item in self._rows if item["id"]==lot_id),None)
+        if not row: QMessageBox.information(self,"請選擇股票","請先在主表選取一筆目前持股的買進批次。")
+        else: self.trigger_price_update("MANUAL_SINGLE",[int(row["security_id"])])
+
+    def show_price_status(self):
+        PriceStatusDialog(self.repository,self).exec()
+
+    def _price_update_started(self, trigger_type):
+        self._active_price_trigger=trigger_type
+        self.price_text.setText("股價：正在背景更新…")
+
+    def _price_update_progress(self,done,total,symbol):
+        self.price_text.setText(f"股價：背景更新 {done} / {total}｜{symbol}")
+
+    def _price_update_finished(self, summary):
+        self.refresh()
+        usable=summary.success_count+summary.fallback_count
+        self.price_text.setText(f"股價：{summary.completed_at:%Y-%m-%d %H:%M}｜成功 {usable}｜失敗 {summary.failed_count}｜略過 {summary.skipped_count}")
+        if summary.trigger_type.startswith("MANUAL"):
+            lines=[f"目前持股 {summary.planned_count} 檔｜官方成功 {summary.success_count}｜備援成功 {summary.fallback_count}｜失敗 {summary.failed_count}｜略過 {summary.skipped_count}"]
+            failures=[r for r in summary.results if r.status.value=="FAILED"]
+            if failures: lines.append("\n"+"\n".join(f"{r.symbol} {r.name}：{r.message}" for r in failures[:10]))
+            QMessageBox.information(self,"股價更新完成","\n".join(lines))
+
+    def _price_update_failed(self, message):
+        self.price_text.setText("股價：更新程序失敗，已保留原價格")
+        if getattr(self,"_active_price_trigger","").startswith("MANUAL"):
+            QMessageBox.warning(self,"股價更新失敗",message)
+
+    def closeEvent(self,event):
+        if hasattr(self,"price_scheduler") and self.price_scheduler.is_running:
+            QMessageBox.information(self,"股價更新進行中","請等待背景股價更新完成後再關閉程式，以確保更新紀錄完整。")
+            event.ignore(); return
+        super().closeEvent(event)
 
     def import_excel(self):
         result=self.backup.run("BEFORE_EXCEL_IMPORT"); self.show_backup_result(result)

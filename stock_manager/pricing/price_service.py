@@ -6,11 +6,10 @@ from stock_manager.database import PortfolioRepository
 
 
 class PriceService:
-    """V1 以可追溯的手動價格為主；外部報價來源可透過相同介面擴充。"""
+    """保留相容介面的手動價格服務。"""
 
     def __init__(self, repository: PortfolioRepository):
         self.repository = repository
 
     def update_manual(self, security_id: int, price: object, price_date: str | None = None) -> None:
-        self.repository.add_price(security_id, price, price_date or date.today().isoformat(), "手動輸入")
-
+        self.repository.add_price(security_id, price, price_date or date.today().isoformat(), "MANUAL")

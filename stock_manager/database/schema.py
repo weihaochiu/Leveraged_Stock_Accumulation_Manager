@@ -172,7 +172,50 @@ CREATE TABLE IF NOT EXISTS price_history (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     source TEXT NOT NULL DEFAULT 'MANUAL',
     daily_change_pct REAL,
+    exchange TEXT NOT NULL DEFAULT '',
+    open_price REAL,
+    high_price REAL,
+    low_price REAL,
+    volume_shares INTEGER,
+    turnover_twd INTEGER,
+    transaction_count INTEGER,
+    price_change REAL,
+    quote_type TEXT NOT NULL DEFAULT 'CLOSE',
+    fetched_at TEXT,
+    is_manual_override INTEGER NOT NULL DEFAULT 0,
+    warning_message TEXT NOT NULL DEFAULT '',
     UNIQUE(security_id, price_date, source)
+);
+CREATE TABLE IF NOT EXISTS price_update_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    planned_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    fallback_success_count INTEGER NOT NULL DEFAULT 0,
+    failed_count INTEGER NOT NULL DEFAULT 0,
+    skipped_count INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'RUNNING'
+);
+CREATE TABLE IF NOT EXISTS price_update_details (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES price_update_runs(id),
+    security_id INTEGER NOT NULL REFERENCES securities(id),
+    status TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    trade_date TEXT,
+    message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(run_id, security_id)
+);
+CREATE TABLE IF NOT EXISTS price_provider_health (
+    source TEXT PRIMARY KEY,
+    last_success_at TEXT,
+    last_failure_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS reconciliations (
     id TEXT PRIMARY KEY,
@@ -246,6 +289,7 @@ CREATE TABLE IF NOT EXISTS ocr_drafts (
 CREATE INDEX IF NOT EXISTS idx_lots_security ON buy_lots(security_id);
 CREATE INDEX IF NOT EXISTS idx_sells_lot ON sell_transactions(lot_id);
 CREATE INDEX IF NOT EXISTS idx_prices_security_date ON price_history(security_id, price_date DESC);
+CREATE INDEX IF NOT EXISTS idx_price_details_security ON price_update_details(security_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dividends_lot ON dividends(lot_id);
 """
 
@@ -265,5 +309,12 @@ DEFAULT_SETTINGS = {
     "backup_frequency": "DAILY_FIRST",
     "backup_on_exit": "0",
     "last_startup_backup_date": "",
+    "price_auto_update_on_startup": "1",
+    "price_schedule_enabled": "1",
+    "price_schedule_times": "14:30,15:00,17:00",
+    "price_request_timeout_seconds": "12",
+    "price_retry_delays_seconds": "2,5",
+    "price_anomaly_threshold_pct": "20",
+    "price_finmind_fallback_enabled": "0",
+    "price_finmind_token": "",
 }
-
