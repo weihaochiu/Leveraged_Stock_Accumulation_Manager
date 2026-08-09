@@ -16,6 +16,12 @@ def main() -> int:
         print("缺少 PySide6。Windows 使用者請雙擊 setup_and_run.bat 完成安裝。")
         return 2
     from stock_manager.app.main_window import MainWindow
+    try:
+        from stock_manager.ui import THEME_VERSION, apply_light_theme
+    except (ImportError, OSError) as exc:
+        print(f"配色主題檔案不完整或未放在正確位置：{exc}")
+        print("請將更新 ZIP 解壓縮到原程式根目錄，並確認已覆蓋 stock_manager 資料夾。")
+        return 3
 
     paths=AppPaths.resolve(); configure_logging(paths.logs); db=Database(paths.database); repository=PortfolioRepository(db)
     backup=BackupService(db,repository,paths.backups); backup.ensure_default_target(paths.backups)
@@ -26,11 +32,18 @@ def main() -> int:
             startup_result=backup.run("STARTUP")
             if startup_result.get("successes",0)>0: repository.set_setting("last_startup_backup_date",date.today().isoformat())
         else: startup_result={"status":"SKIPPED","successes":0,"total":len(backup.targets())}
-    app=QApplication(sys.argv); app.setApplicationName(APP_NAME); app.setStyle("Fusion")
-    app.setStyleSheet("""
-        QMainWindow,QDialog{background:#F8FAFC} QToolBar{background:#FFFFFF;border-bottom:1px solid #CBD5E1;padding:5px;spacing:4px}
-        QToolButton,QPushButton{padding:6px 11px} QTableWidget{background:#FFFFFF;gridline-color:#E2E8F0;selection-background-color:#BFDBFE;selection-color:#111827}
-        QHeaderView::section{background:#E2E8F0;padding:7px;border:0;border-right:1px solid #CBD5E1;font-weight:600}
-        QLineEdit,QComboBox,QSpinBox,QDoubleSpinBox,QDateEdit,QPlainTextEdit{background:#FFFFFF;padding:5px;border:1px solid #CBD5E1;border-radius:4px}
-    """)
-    window=MainWindow(repository,paths,backup,startup_result); window.show(); return app.exec()
+    app=QApplication(sys.argv); app.setApplicationName(APP_NAME)
+    try:
+        apply_light_theme(app)
+    except Exception as exc:
+        QMessageBox.critical(
+            None,
+            "配色主題載入失敗",
+            "新版配色沒有成功載入。\n\n"
+            f"錯誤：{exc}\n\n"
+            "請重新將更新 ZIP 解壓縮到原程式根目錄並覆蓋檔案。",
+        )
+        return 3
+    window=MainWindow(repository,paths,backup,startup_result)
+    window.setWindowTitle(f"{APP_NAME} v{THEME_VERSION}｜淺色主題修正版")
+    window.show(); return app.exec()
